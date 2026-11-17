@@ -1,4 +1,4 @@
-import hashlib,json
+import hashlib,json,pickle
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split,KFold,cross_val_score
@@ -7,6 +7,39 @@ from sklearn.metrics import mean_absolute_error,mean_squared_error
 from .domain_validation import validate_parameters
 FEATURES=['moisture','thickness','temperature','airflow']
 SUBSETS=[['moisture','temperature'],['moisture','thickness','temperature'],FEATURES]
+BLIND_SEED=42
+def _matrix(records):
+    X=np.array([[r['values'][f] for f in FEATURES] for r in records],float)
+    y=np.array([r['values']['minutes'] for r in records],float)
+    return X,y
+def fit_blind_model(records,parameters):
+    # 盲测冻结模型：特征子集选择只在训练行内做3折CV，不接触任何盲测标签；最终森林用全部训练行拟合
+    p=validate_parameters(parameters)
+    if len(records)<40:raise ValueError('至少40条独立工艺样本，才能冻结盲测模型')
+    X,y=_matrix(records)
+    cv=KFold(3,shuffle=True,random_state=BLIND_SEED);candidates=[]
+    for subset in SUBSETS:
+        cols=[FEATURES.index(f) for f in subset]
+        model=RandomForestRegressor(n_estimators=p['trees'],max_depth=p['depth'],random_state=BLIND_SEED,n_jobs=1)
+        errors=-cross_val_score(model,X[:,cols],y,cv=cv,scoring='neg_mean_absolute_error',n_jobs=1)
+        candidates.append({'features':subset,'cv_mae':float(errors.mean()),'fold_mae':errors.tolist()})
+    best=min(candidates,key=lambda c:c['cv_mae'])
+    cols=[FEATURES.index(f) for f in best['features']]
+    model=RandomForestRegressor(n_estimators=p['trees'],max_depth=p['depth'],random_state=BLIND_SEED,n_jobs=1).fit(X[:,cols],y)
+    training_checksum=hashlib.sha256(X.tobytes()+y.tobytes()).hexdigest()
+    model_checksum=hashlib.sha256(json.dumps({'parameters':p,'features':best['features'],'training_checksum':training_checksum,'seed':BLIND_SEED},sort_keys=True).encode()).hexdigest()
+    return {'model':model,'features':best['features'],'candidates':candidates,'training_checksum':training_checksum,'model_checksum':model_checksum,'training_rows':len(records),'pickle':pickle.dumps(model)}
+def predict_blind(bundle,inputs):
+    features=bundle['features'];cols=[FEATURES.index(f) for f in features]
+    Xb=np.array([[r['values'][f] for f in FEATURES] for r in inputs],float)
+    pred=bundle['model'].predict(Xb[:,cols])
+    rows=[{'reference':inputs[i]['reference'],'predicted_minutes':float(v)} for i,v in enumerate(pred)]
+    predictions_checksum=hashlib.sha256(json.dumps(rows,sort_keys=True).encode()).hexdigest()
+    return rows,predictions_checksum
+def unblind_metrics(rows):
+    actual=np.array([r['actual_minutes'] for r in rows],float)
+    predicted=np.array([r['predicted_minutes'] for r in rows],float)
+    return {'mae':float(mean_absolute_error(actual,predicted)),'rmse':float(np.sqrt(mean_squared_error(actual,predicted))),'n':len(rows)}
 def calculate(records,parameters):
     p=validate_parameters(parameters)
     if len(records)<40:raise ValueError('至少40条独立工艺样本，才能拆分训练与留出验证')

@@ -6,6 +6,7 @@ from src.models.user import User
 from src.models.source import Source
 from src.models.record import Record
 from src.models.run import Run
+from src.models.blind_batch import BlindBatch
 from src.models import note,audit
 from src.utils.security import hash_password
 from src.utils.serialization import now
@@ -52,6 +53,18 @@ def seed():
             if batch==0 and not db.scalar(select(Run.id).where(Run.name=='首轮种子研究')):
                 records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
                 run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)
+        # 独立盲测批：20条样本，标签封存；试件编号与训练来源完全隔离
+        if CONFIG['algorithm']=='forest' and not db.scalar(select(BlindBatch.id).where(BlindBatch.name=='十一月独立盲测批')):
+            blind_inputs=[];blind_labels=[]
+            for index in range(20):
+                moisture=round(rng.uniform(20,60),2);thickness=round(rng.uniform(1,8),2);temperature=round(rng.uniform(50,100),2);airflow=round(rng.uniform(1,5),2)
+                minutes=round(max(5,12+1.6*moisture+8*thickness-.45*temperature-3*airflow+0.1*moisture*thickness+rng.gauss(0,3)),2)
+                blind_inputs.append({'reference':CONFIG['code']+f'-BLIND-{index+1:03}','values':{'moisture':moisture,'thickness':thickness,'temperature':temperature,'airflow':airflow}})
+                blind_labels.append(minutes)
+            from src.schemas.blind import BlindBatchInput
+            from src.services.blind import create_batch
+            class SeedUser:email='seed@'+CONFIG['slug']+'.demo'
+            create_batch(db,SeedUser(),BlindBatchInput(name='十一月独立盲测批',inputs=blind_inputs,labels=blind_labels))
         db.commit();print(json.dumps(counts(db),ensure_ascii=False))
     for id in queued:
         try:queue.rpush('analysis:queue',id)

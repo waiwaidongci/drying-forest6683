@@ -8,12 +8,13 @@ RandomForest回归、训练内特征子集交叉验证与留出集MAE。为槐�
 
 ## 业务模块
 
-1. 业务总览：批次、样本、任务与批准交付账册。
+1. 业务总览：批次、样本、任务、盲测账册与批准交付账册。
 2. 干燥研究：创建/修改来源说明、查看样本、用真实业务字段追加记录；列表分页。
 3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
 4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
-5. 工艺试验备忘：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+5. 独立盲测：实测时长封存的独立盲测批，先冻结可复现模型、写预测，再申请唯一一次揭盲。
+6. 工艺试验备忘：分析师草案→负责人批准→阅读者下载批准快照。
+7. 审计：登录、来源修改、任务worker完成、盲测封存/申请/揭盲、业务说明批准等事件。
 
 ## 快速启动
 
@@ -53,7 +54,7 @@ JWT有效期8小时；PBKDF2盐化哈希保存密码；角色每请求从数据�
 
 ## 实体与字段
 
-DryingStudy / DryingSample / RegressionRun / ProcessMemo 是核心实体；另有User和Audit。数据库实际表：`drying_studies` → `drying_samples` → `regression_runs` → `process_memos`。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：初始湿度 %（`moisture`）、厚度 mm（`thickness`）、设定温度 ℃（`temperature`）、风量 m³/min（`airflow`）、实测时长 min（`minutes`）。
+DryingStudy / DryingSample / RegressionRun / ProcessMemo 是核心实体；盲测另有 BlindBatch / BlindApplication；还有User和Audit。数据库实际表：`drying_studies` → `drying_samples` → `regression_runs` → `process_memos`；盲测为 `blind_batches` / `blind_applications`。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：初始湿度 %（`moisture`）、厚度 mm（`thickness`）、设定温度 ℃（`temperature`）、风量 m³/min（`airflow`）、实测时长 min（`minutes`）。盲测输入只接受前四个特征列，`minutes` 只能通过封存标签通道提交。
 
 实体贯穿 `backend/src/models`、`schemas`、`services`、`controllers`、`routes`，以及 `frontend/src/api/research.js`、`stores/research.js` 和 `pages`。`Source.key` 与 `(Record.source_id, reference)` 为自然键；来源改名不会修改已冻结任务输入。业务说明在创建时保存结果快照，批准后从该快照导出。
 
@@ -69,6 +70,27 @@ RandomForest回归、训练内特征子集交叉验证与留出集MAE，全部�
 失败态：业务字段缺失/非有限数值、参数越界、样本不足、退化特征或结构错误均明确拒绝或将任务标failed，错误消息保存在任务中。可回到来源或配置修正后重新执行，历史失败记录保留。
 
 已知边界：只比较三个预定义特征子集，超参数由分析前固定；留出集不用于选择。置换重要性来自最后留出集，不可反复依据它改模再宣称独立验证。不含预测区间，不用于外推工艺。
+
+## 独立盲测批（防止留出集被反复“看答案调参”）
+
+反复查看同一留出误差再调参，会把留出集变成训练依据。独立盲测批把实测时长彻底封存，特征选择、调参与普通查看都接触不到标签，只允许在模型冻结、预测写出之后揭盲一次。
+
+**封存与隔离**
+
+- 盲测输入只接受 `moisture/thickness/temperature/airflow` 四个特征列；夹带 `minutes` 或未知字段一律 422。实测时长走独立 `labels` 通道，仅写入 `ARTIFACT_DIR/blind/labels-{batch_id}.json`（权限 `0600`），数据库不存标签，列表/详情不回传工件路径。
+- 训练样本与盲测样本按试件编号双向隔离：封存时、申请时、追加训练样本时三处校验，编号重合即 422。
+- 盲测批三态：`sealed` 封存 → `occupied` 占用 → `revealed` 已揭盲。
+
+**冻结、申请与揭盲**
+
+- 研究先冻结可复现模型：申请即生成独立 `Run` 固化训练快照，之后修改训练数据不改变该模型；特征子集选择只在训练行做 3 折 CV，全程不读盲测标签。
+- 同一盲测批的并发申请只接受一个：服务层校验 + 数据库部分唯一索引双重兜底（8 线程竞态测试恰好 1 个成功）。
+- 流程为 `冻结 → 写出预测（仅编号与预测值）→ 申请一次揭盲`。揭盲请求幂等，排队/执行中重复提交不会产生第二个揭盲任务。
+- 失败重试仍绑定原 `run_id`，确定性 seed 保证重冻结出同一模型；中断（含 worker 崩溃）可在启动时恢复重入队，预测与揭盲均只执行一次。
+- 揭盲前改动盲测输入会使所有未揭盲申请置 `invalid`、批次释放回封存，重试与揭盲被拒，需重新申请；已揭盲批输入是误差证据，禁止改动。失效/已揭盲的旧研究仍可被阅读者读取。
+- 揭盲后给出盲测 MAE/RMSE、逐行实测/预测/误差与模型/预测/标签三类校验和，可导出 CSV。
+
+盲测实体 `BlindBatch / BlindApplication`（表 `blind_batches / blind_applications`），接口前缀 `/blind/batches`、`/blind/applications`；worker 在同一进程用 `BLPOP` 同时消费 `analysis:queue` 与 `blind:queue`。测试见 `test-artifacts/gb-0044/`。
 
 ## 演示数据与一天剧本
 
@@ -103,6 +125,6 @@ backend/migrations/001_initial.sql
 | DATABASE_URL / REDIS_URL | Compose内部连接，定义在compose的env锚点 |
 | ARTIFACT_DIR | `/artifacts`，后端worker共享 |
 
-共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
+共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved，以及盲测批 sealed/occupied/revealed 与盲测申请九态。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
 
 测试及截图在批根 `test-artifacts/gb-0044/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。

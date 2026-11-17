@@ -32,4 +32,7 @@ def add_records(db,user,id,data):
         except ValueError as e:raise HTTPException(422,str(e))
         if db.scalar(select(Record.id).where(Record.source_id==id,Record.reference==r.reference)):raise HTTPException(409,'样本编号已存在：'+r.reference)
         validated.append(Record(source_id=id,reference=r.reference,values=values))
+    # 训练样本与盲测样本按试件编号隔离：编号不得落入任何盲测批
+    from .blind import assert_new_record_isolated
+    for r in data.records:assert_new_record_isolated(db,id,r.reference)
     db.add_all(validated);log(db,user,'records.added',id,str(len(validated)));db.commit();return {'added':len(validated)}

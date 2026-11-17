@@ -8,6 +8,7 @@ from .models import source,record,user,note,audit
 from .services.algorithm import calculate
 from .services.audit import log
 from .services.export import csv_response
+from .services import blind
 queue=Redis.from_url(REDIS_URL)
 ARTIFACT_DIR.mkdir(parents=True,exist_ok=True)
 def execute(id):
@@ -26,9 +27,17 @@ def execute(id):
             logging.exception('analysis failed');r.state='failed';r.error=str(e)[:2000]
             log(db,'worker','run.failed',r.id,r.error)
         db.commit()
+def execute_blind(payload):
+    try:blind.execute_job(payload['stage'],int(payload['id']))
+    except Exception:logging.exception('blind job failed')
 def main():
     while True:
         (ARTIFACT_DIR/'heartbeat').write_text(str(time.time()))
-        value=queue.blpop('analysis:queue',timeout=2)
-        if value:execute(int(value[1]))
+        item=queue.blpop(['analysis:queue',blind.BLIND_QUEUE],timeout=2)
+        if not item:continue
+        key,value=item
+        if key=='analysis:queue':execute(int(value))
+        else:
+            try:execute_blind(json.loads(value))
+            except (ValueError,TypeError):logging.exception('bad blind payload')
 if __name__=='__main__':main()

@@ -1,5 +1,33 @@
 import math
 from ..config.settings import CONFIG
+FEATURE_KEYS=['moisture','thickness','temperature','airflow']
+def validate_blind_input(values):
+    # 盲测输入只接受四个特征列；出现实测时长列即拒绝，避免标签经输入通道泄漏
+    if 'minutes' in values:raise ValueError('盲测输入不得包含实测时长，标签在封存通道单独提交')
+    unknown=set(values)-set(FEATURE_KEYS)
+    if unknown:raise ValueError('盲测输入包含不支持的字段：'+','.join(sorted(unknown)))
+    out={}
+    for key in FEATURE_KEYS:
+        label=next(name for k,name,_ in CONFIG['fields'] if k==key)
+        v=values.get(key)
+        if isinstance(v,bool):raise ValueError(label+'必须为数值')
+        try:v=float(v)
+        except (TypeError,ValueError):raise ValueError(label+'必须为数值')
+        if not math.isfinite(v):raise ValueError(label+'必须是有限数值')
+        out[key]=v
+    if not 0<out['moisture']<=100 or min(out['thickness'],out['temperature'],out['airflow'])<=0:
+        raise ValueError('湿度需在(0,100]，其余工艺量为正')
+    return out
+def validate_blind_labels(labels,count):
+    if len(labels)!=count:raise ValueError('实测时长条数必须与盲测输入条数一致')
+    out=[]
+    for v in labels:
+        if isinstance(v,bool):raise ValueError('实测时长必须为数值')
+        try:n=float(v)
+        except (TypeError,ValueError):raise ValueError('实测时长必须为数值')
+        if not math.isfinite(n) or n<=0:raise ValueError('实测时长必须为正有限数值')
+        out.append(n)
+    return out
 def validate_record(values):
     out={}
     for key,label,kind in CONFIG['fields']:
